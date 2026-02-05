@@ -3,6 +3,16 @@
 
 #include "../tester/utils.h"
 
+template <typename T>
+__global__ void trace_kernel(const T* input, T* result, size_t n, size_t cols) {
+  size_t step = gridDim.x * blockDim.x;
+  size_t start = blockIdx.x * blockDim.x + threadIdx.x;
+  for (size_t i = start; i < n; i += step) {
+    size_t offset = i * cols + i;
+    atomicAdd(result, input[offset]);
+  }
+}
+
 /**
  * @brief Computes the trace of a matrix.
  *
@@ -20,7 +30,24 @@
 template <typename T>
 T trace(const std::vector<T>& h_input, size_t rows, size_t cols) {
   // TODO: Implement the trace function
-  return T(-1);
+
+  T h_result = 0;
+  T* d_input, *d_result;
+  cudaMalloc(&d_input, rows * cols * sizeof(T));
+  cudaMalloc(&d_result, sizeof(T));
+
+  cudaMemcpy(d_input, h_input.data(), rows * cols * sizeof(T), cudaMemcpyHostToDevice);
+  cudaMemcpy(d_result, &h_result, sizeof(T), cudaMemcpyHostToDevice);
+  
+  int block_size = 256;
+  int grid_size = 256;
+  trace_kernel<T><<<dim3(grid_size), dim3(block_size)>>>(d_input, d_result, std::min(rows, cols), cols);
+  cudaMemcpy(&h_result, d_result, sizeof(T), cudaMemcpyDeviceToHost);
+
+  cudaFree(d_input);
+  cudaFree(d_result);
+
+  return h_result;
 }
 
 /**
