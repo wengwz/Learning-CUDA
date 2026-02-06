@@ -3,6 +3,8 @@
 
 #include "../tester/utils.h"
 
+#include <float.h>
+
 template <typename T>
 __global__ void trace_kernel(const T* input, T* result, size_t n, size_t cols) {
   size_t step = gridDim.x * blockDim.x;
@@ -33,21 +35,94 @@ T trace(const std::vector<T>& h_input, size_t rows, size_t cols) {
 
   T h_result = 0;
   T* d_input, *d_result;
+
+  // allocate device memory
   cudaMalloc(&d_input, rows * cols * sizeof(T));
   cudaMalloc(&d_result, sizeof(T));
 
+  // copy data to device
   cudaMemcpy(d_input, h_input.data(), rows * cols * sizeof(T), cudaMemcpyHostToDevice);
   cudaMemcpy(d_result, &h_result, sizeof(T), cudaMemcpyHostToDevice);
   
   int block_size = 256;
   int grid_size = 256;
+  // launch kernel function
   trace_kernel<T><<<dim3(grid_size), dim3(block_size)>>>(d_input, d_result, std::min(rows, cols), cols);
+
+  // copy result from device to host
   cudaMemcpy(&h_result, d_result, sizeof(T), cudaMemcpyDeviceToHost);
 
   cudaFree(d_input);
   cudaFree(d_result);
 
   return h_result;
+}
+
+template<typename T> __device__ __forceinline__ float get_inf() {
+  if constexpr (std::is_same_v<T, float>) {
+    return -FLT_MAX;
+  } else if constexpr (std::is_same_v<T, __half>) {
+    return -65504.0f;
+  } else {
+    return -FLT_MAX;
+  }
+};
+
+// CUDA Kernel
+template <typename T>
+__global__ void attention_kernel(const T* q, const T* k, const T* v, T* o,
+                                 int target_seq_len, int src_seq_len, 
+                                 int query_heads, int kv_heads, int head_dim, 
+                                 float scale, bool is_causal) {
+    int b = blockIdx.x; 
+    int h = blockIdx.y; 
+    int i = blockIdx.z; 
+
+    if (b >= gridDim.x || h >= query_heads || i >= target_seq_len) return;
+
+    int groups = query_heads / kv_heads;
+    int kv_h = h / groups;
+
+    extern __shared__ float scores[]; 
+
+    // calculate QK^T
+    float max_score = get_inf<T>();
+    for (int j = 0; j < src_seq_len; ++j) {
+        if (is_causal && i < j) {
+            scores[j] = get_inf<T>();
+        } else {
+            float sum = 0.0f;
+            for (int d = 0; d < head_dim; ++d) {
+                float q_val = (float)q[((b * target_seq_len + i) * query_heads + h) * head_dim + d];
+                float k_val = (float)k[((b * src_seq_len + j) * kv_heads + kv_h) * head_dim + d];
+                sum += q_val * k_val;
+            }
+            scores[j] = sum * scale;
+            if (scores[j] > max_score) max_score = scores[j];
+        }
+    }
+
+    // softmax
+    float exp_sum = 0.0f;
+    for (int j = 0; j < src_seq_len; ++j) {
+        if (scores[j] > get_inf<T>()) {
+            scores[j] = expf(scores[j] - max_score);
+            exp_sum += scores[j];
+        } else {
+            scores[j] = 0.0f;
+        }
+    }
+
+    // compute output O
+    for (int d = 0; d < head_dim; ++d) {
+        float out_val = 0.0f;
+        for (int j = 0; j < src_seq_len; ++j) {
+            float v_val = (float)v[((b * src_seq_len + j) * kv_heads + kv_h) * head_dim + d];
+            out_val += (scores[j] / exp_sum) * v_val;
+        }
+
+        o[((b * target_seq_len + i) * query_heads + h) * head_dim + d] = (T)out_val;
+    }
 }
 
 /**
@@ -70,8 +145,44 @@ template <typename T>
 void flashAttention(const std::vector<T>& h_q, const std::vector<T>& h_k,
                     const std::vector<T>& h_v, std::vector<T>& h_o,
                     int batch_size, int target_seq_len, int src_seq_len, 
-                    int query_heads, int kv_heads, int head_dim, bool is_causal) {       
-  // TODO: Implement the flash attention function
+                    int query_heads, int kv_heads, int head_dim, bool is_causal) {
+
+    T *d_q, *d_k, *d_v, *d_o;
+    size_t q_size = h_q.size() * sizeof(T);
+    size_t k_size = h_k.size() * sizeof(T);
+    size_t v_size = h_v.size() * sizeof(T);
+    size_t o_size = h_o.size() * sizeof(T);
+
+    // allocate device memory
+    cudaMalloc(&d_q, q_size);
+    cudaMalloc(&d_k, k_size);
+    cudaMalloc(&d_v, v_size);
+    cudaMalloc(&d_o, o_size);
+
+    // copy data to device
+    cudaMemcpy(d_q, h_q.data(), q_size, cudaMemcpyHostToDevice);
+    cudaMemcpy(d_k, h_k.data(), k_size, cudaMemcpyHostToDevice);
+    cudaMemcpy(d_v, h_v.data(), v_size, cudaMemcpyHostToDevice);
+
+    float scale_fac = 1.0 / std::sqrt(head_dim);
+    
+    dim3 gridDim(batch_size, query_heads, target_seq_len);
+    dim3 blockDim(1); 
+    size_t smem_size = src_seq_len * sizeof(float);
+
+    // launch kernel function
+    attention_kernel<<<gridDim, blockDim, smem_size>>>(
+        d_q, d_k, d_v, d_o, target_seq_len, src_seq_len, 
+        query_heads, kv_heads, head_dim, scale_fac, is_causal
+    );
+
+    // copy result from device to host
+    cudaMemcpy(h_o.data(), d_o, o_size, cudaMemcpyDeviceToHost);
+
+    cudaFree(d_q); 
+    cudaFree(d_k); 
+    cudaFree(d_v); 
+    cudaFree(d_o);
 }
 
 // *********************************************************************
